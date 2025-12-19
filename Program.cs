@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 
 class Program
@@ -37,7 +38,7 @@ class Program
                 ForceShutdown();
 
             TimeSpan start = TimeSpan.Parse(schedule[today].Start);
-            TimeSpan end   = TimeSpan.Parse(schedule[today].End);
+            TimeSpan end = TimeSpan.Parse(schedule[today].End);
 
             bool allowed = now >= start && now <= end;
 
@@ -67,6 +68,9 @@ class Program
 
 class TimeWindow
 {
+    [JsonPropertyName("start")]
     public string Start { get; set; }
+
+    [JsonPropertyName("end")]
     public string End { get; set; }
 }
