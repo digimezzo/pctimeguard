@@ -1,13 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Net.Http;
+﻿using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Tasks;
 
 class Program
 {
+    private const string TimeApiUrl = "http://worldtimeapi.org/api/ip";
+
+    private const string ScheduleUrl = "https://raw.githubusercontent.com/digimezzo/scheduling/main/schedule.json";
+
     static async Task Main()
     {
         try
@@ -17,39 +17,77 @@ class Program
                 Timeout = TimeSpan.FromSeconds(10)
             };
 
-            // 1. Get current internet time
-            string timeResponse = await client.GetStringAsync("http://worldtimeapi.org/api/ip");
-            using var timeDoc = JsonDocument.Parse(timeResponse);
-            string datetimeStr = timeDoc.RootElement.GetProperty("datetime").GetString();
-            DateTime nowUtc = DateTime.Parse(datetimeStr);
+            (DateTime nowUtc, Dictionary<string, TimeWindow> schedule) = await GetTimeAndScheduleWithRetry(client);
+
             TimeSpan now = nowUtc.TimeOfDay;
             string today = nowUtc.DayOfWeek.ToString();
 
-            // 2. Download schedule
-            string scheduleUrl =
-                "https://raw.githubusercontent.com/digimezzo/scheduling/main/schedule.json";
-
-            string scheduleJson = await client.GetStringAsync(scheduleUrl);
-
-            var schedule = JsonSerializer.Deserialize<
-                Dictionary<string, TimeWindow>>(scheduleJson);
-
-            if (schedule == null || !schedule.ContainsKey(today))
+            if (!schedule.TryGetValue(today, out TimeWindow? window))
+            {
                 ForceShutdown();
+            }
 
-            TimeSpan start = TimeSpan.Parse(schedule[today].Start);
-            TimeSpan end = TimeSpan.Parse(schedule[today].End);
+            if (string.IsNullOrWhiteSpace(window!.Start) || string.IsNullOrWhiteSpace(window.End))
+            {
+                ForceShutdown();
+            }
+
+            TimeSpan start = TimeSpan.Parse(window.Start);
+            TimeSpan end = TimeSpan.Parse(window.End);
 
             bool allowed = now >= start && now <= end;
 
             if (!allowed)
+            {
                 ForceShutdown();
+            }
         }
         catch
         {
-            // ANY failure = shutdown
             ForceShutdown();
         }
+    }
+
+    static async Task<(DateTime, Dictionary<string, TimeWindow>)> GetTimeAndScheduleWithRetry(HttpClient client)
+    {
+        const int maxRetries = 3;
+        const int delaySeconds = 30;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                string timeResponse = await client.GetStringAsync(TimeApiUrl);
+
+                using var timeDoc = JsonDocument.Parse(timeResponse);
+                string? datetimeStr = timeDoc.RootElement.GetProperty("datetime").GetString();
+
+                if (string.IsNullOrWhiteSpace(datetimeStr))
+                {
+                    throw new Exception("Invalid time response");
+                }
+
+                DateTime nowUtc = DateTime.Parse(datetimeStr);
+
+                string scheduleJson = await client.GetStringAsync(ScheduleUrl);
+
+                var schedule = JsonSerializer.Deserialize<Dictionary<string, TimeWindow>>(scheduleJson) ?? throw new Exception("Invalid schedule");
+                return (nowUtc, schedule);
+            }
+            catch
+            {
+                if (attempt == maxRetries)
+                {
+                    break;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+            }
+        }
+
+        // All retries failed
+        ForceShutdown();
+        throw new Exception("Unreachable");
     }
 
     static void ForceShutdown()
@@ -69,8 +107,8 @@ class Program
 class TimeWindow
 {
     [JsonPropertyName("start")]
-    public string Start { get; set; }
+    public required string Start { get; set; }
 
     [JsonPropertyName("end")]
-    public string End { get; set; }
+    public required string End { get; set; }
 }
