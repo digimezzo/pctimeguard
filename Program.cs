@@ -30,14 +30,16 @@ class Program
 
             if (!schedule.TryGetValue(today, out TimeWindow? window))
             {
-                Logger.Log($"No schedule entry for {today}");
-                ForceShutdown();
+                string reason = $"No schedule entry for {today}";
+                Logger.Log(reason);
+                DelayedShutdown(reason);
             }
 
             if (string.IsNullOrWhiteSpace(window!.Start) || string.IsNullOrWhiteSpace(window.End))
             {
-                Logger.Log("Schedule start or end is empty");
-                ForceShutdown();
+                string reason = "Schedule start or end is empty";
+                Logger.Log(reason);
+                DelayedShutdown(reason);
             }
 
             TimeSpan start = TimeSpan.Parse(window.Start);
@@ -49,16 +51,18 @@ class Program
 
             if (!allowed)
             {
-                Logger.Log("Outside allowed window --> shutdown");
-                ForceShutdown();
+                string reason = "Outside allowed window";
+                Logger.Log(reason);
+                ShortDelayedShutdown(reason);
             }
 
             Logger.Log("Within allowed window");
         }
         catch (Exception ex)
         {
-            Logger.Log($"Unhandled exception: {ex}");
-            ForceShutdown();
+            string reason = $"Unhandled exception: {ex}";
+            Logger.Log(reason);
+            DelayedShutdown(reason);
         }
     }
 
@@ -113,19 +117,50 @@ class Program
             }
         }
 
-        Logger.Log("All retries exhausted → shutdown");
-        ForceShutdown();
+        string reason = "All retries exhausted";
+        Logger.Log(reason);
+        DelayedShutdown(reason);
         throw new Exception("Unreachable");
     }
 
-    static void ForceShutdown()
+    // static void ForceShutdown()
+    // {
+    //     Logger.Log("FORCE SHUTDOWN triggered");
+
+    //     Process.Start(new ProcessStartInfo
+    //     {
+    //         FileName = "shutdown",
+    //         Arguments = "/s /f /t 0",
+    //         CreateNoWindow = true,
+    //         UseShellExecute = false
+    //     });
+
+    //     Environment.Exit(0);
+    // }
+
+    static void DelayedShutdown(string reason)
     {
-        Logger.Log("FORCE SHUTDOWN triggered");
+        Logger.Log("DELAYED SHUTDOWN: " + reason);
 
         Process.Start(new ProcessStartInfo
         {
             FileName = "shutdown",
-            Arguments = "/s /f /t 0",
+            Arguments = $"/s /f /t 300 /c \"PC will shut down in 5 minutes. Reason: {reason}\"",
+            CreateNoWindow = true,
+            UseShellExecute = false
+        });
+
+        Environment.Exit(0);
+    }
+
+    static void ShortDelayedShutdown(string reason)
+    {
+        Logger.Log("DELAYED SHUTDOWN: " + reason);
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "shutdown",
+            Arguments = $"/s /f /t 30 /c \"PC will shut down in 30 seconds. Reason: {reason}\"",
             CreateNoWindow = true,
             UseShellExecute = false
         });
@@ -164,7 +199,7 @@ static class Logger
         }
         catch
         {
-            // Logging must never break enforcement
+            // Logging must never break
         }
     }
 }
