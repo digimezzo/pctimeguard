@@ -67,61 +67,75 @@ class Program
     }
 
     static async Task<(DateTime, Dictionary<string, TimeWindow>)>
-        GetTimeAndScheduleWithRetry(HttpClient client)
+    GetTimeAndScheduleWithRetry(HttpClient client)
     {
         const int maxRetries = 3;
         const int delaySeconds = 30;
+
+        DateTime? resolvedTime = null;
 
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
             {
-                Logger.Log($"Attempt {attempt}: fetching internet time");
-
-                string timeResponse = await client.GetStringAsync(TimeApiUrl);
-
-                using var timeDoc = JsonDocument.Parse(timeResponse);
-                string? datetimeStr = timeDoc.RootElement.GetProperty("datetime").GetString();
-
-                if (string.IsNullOrWhiteSpace(datetimeStr))
+                if (resolvedTime == null)
                 {
-                    throw new Exception("Invalid time response");
+                    try
+                    {
+                        Logger.Log($"Attempt {attempt}: fetching internet time");
+
+                        string timeResponse = await client.GetStringAsync(TimeApiUrl);
+
+                        using var timeDoc = JsonDocument.Parse(timeResponse);
+                        string? datetimeStr =
+                            timeDoc.RootElement.GetProperty("datetime").GetString();
+
+                        if (string.IsNullOrWhiteSpace(datetimeStr))
+                            throw new Exception("Invalid time response");
+
+                        resolvedTime = DateTime.Parse(datetimeStr);
+                        Logger.Log($"Internet time OK: {resolvedTime:O}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log($"Internet time failed: {ex.Message}");
+                        Logger.Log("Falling back to local PC time");
+
+                        resolvedTime = DateTime.Now;
+                    }
                 }
-
-
-                DateTime nowUtc = DateTime.Parse(datetimeStr);
-
-                Logger.Log($"Internet time OK: {nowUtc:O}");
 
                 Logger.Log("Fetching schedule");
 
-                string scheduleJson = await client.GetStringAsync(ScheduleUrl);
+                string scheduleJson =
+                    await client.GetStringAsync(ScheduleUrl);
 
-                var schedule = JsonSerializer.Deserialize<Dictionary<string, TimeWindow>>(scheduleJson) ?? throw new Exception("Invalid schedule");
+                var schedule =
+                    JsonSerializer.Deserialize<Dictionary<string, TimeWindow>>(scheduleJson)
+                    ?? throw new Exception("Invalid schedule");
 
                 Logger.Log($"Schedule OK ({schedule.Count} days)");
 
-                return (nowUtc, schedule);
+                return (resolvedTime.Value, schedule);
             }
             catch (Exception ex)
             {
                 Logger.Log($"Attempt {attempt} failed: {ex.Message}");
 
                 if (attempt == maxRetries)
-                {
                     break;
-                }
 
                 Logger.Log($"Retrying in {delaySeconds} seconds");
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
             }
         }
 
-        string reason = "All retries exhausted";
+        string reason = "Unable to fetch schedule after retries";
         Logger.Log(reason);
         DelayedShutdown(reason);
         throw new Exception("Unreachable");
     }
+
 
     // static void ForceShutdown()
     // {
