@@ -1,9 +1,9 @@
 {
-  "Monday": { "start": "14:00", "end": "22:45" },
-  "Tuesday": { "start": "14:00", "end": "22:45" },
-  "Wednesday": { "start": "14:00", "end": "22:45" },
-  "Thursday": { "start": "14:00", "end": "22:45" },
-  "Friday": { "start": "14:00", "end": "22:45" },
-  "Saturday": { "start": "14:00", "end": "22:45" },
-  "Sunday": { "start": "14:00", "end": "22:45" }
+  "Monday": { "start": "14:00", "end": "18:00" },
+  "Tuesday": { "start": "14:00", "end": "18:00" },
+  "Wednesday": { "start": "14:00", "end": "18:00" },
+  "Thursday": { "start": "14:00", "end": "18:00" },
+  "Friday": { "start": "14:00", "end": "18:00" },
+  "Saturday": { "start": "14:00", "end": "18:00" },
+  "Sunday": { "start": "14:00", "end": "18:00" }
 }
