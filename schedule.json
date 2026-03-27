@@ -3,7 +3,7 @@
   "Tuesday": { "start": "20:00", "end": "21:00" },
   "Wednesday": { "start": "20:00", "end": "21:00" },
   "Thursday": { "start": "20:00", "end": "21:00" },
-  "Friday": { "start": "20:00", "end": "21:00" },
+  "Friday": { "start": "20:00", "end": "21:15" },
   "Saturday": { "start": "19:00", "end": "21:00" },
   "Sunday": { "start": "19:00", "end": "21:00" }
 }
