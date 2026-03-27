@@ -21,33 +21,37 @@ class Program
                 Timeout = TimeSpan.FromSeconds(10)
             };
 
-            (DateTime nowUtc, Dictionary<string, TimeWindow> schedule) = await GetTimeAndScheduleWithRetry(client);
+            (DateTime nowUtc, Dictionary<string, List<TimeWindow>> schedule) = await GetTimeAndScheduleWithRetry(client);
 
             TimeSpan now = nowUtc.TimeOfDay;
             string today = nowUtc.DayOfWeek.ToString();
 
             Logger.Log($"Time OK: {nowUtc:O} (Today={today})");
 
-            if (!schedule.TryGetValue(today, out TimeWindow? window))
+            if (!schedule.TryGetValue(today, out List<TimeWindow>? windows) || windows == null || windows.Count == 0)
             {
                 string reason = $"No schedule entry for {today}";
                 Logger.Log(reason);
                 DelayedShutdown(reason);
             }
 
-            if (string.IsNullOrWhiteSpace(window!.Start) || string.IsNullOrWhiteSpace(window.End))
+            bool allowed = false;
+            foreach (var window in windows)
             {
-                string reason = "Schedule start or end is empty";
-                Logger.Log(reason);
-                DelayedShutdown(reason);
+                if (string.IsNullOrWhiteSpace(window.Start) || string.IsNullOrWhiteSpace(window.End))
+                    continue;
+
+                TimeSpan start = TimeSpan.Parse(window.Start);
+                TimeSpan end = TimeSpan.Parse(window.End);
+
+                Logger.Log($"Allowed window: {start} --> {end}, now={now}");
+
+                if (now >= start && now <= end)
+                {
+                    allowed = true;
+                    break;
+                }
             }
-
-            TimeSpan start = TimeSpan.Parse(window.Start);
-            TimeSpan end = TimeSpan.Parse(window.End);
-
-            Logger.Log($"Allowed window: {start} --> {end}, now={now}");
-
-            bool allowed = now >= start && now <= end;
 
             if (!allowed)
             {
@@ -66,8 +70,7 @@ class Program
         }
     }
 
-    static async Task<(DateTime, Dictionary<string, TimeWindow>)>
-    GetTimeAndScheduleWithRetry(HttpClient client)
+    static async Task<(DateTime, Dictionary<string, List<TimeWindow>>)> GetTimeAndScheduleWithRetry(HttpClient client)
     {
         const int maxRetries = 3;
         const int delaySeconds = 30;
@@ -111,7 +114,7 @@ class Program
                     await client.GetStringAsync(ScheduleUrl);
 
                 var schedule =
-                    JsonSerializer.Deserialize<Dictionary<string, TimeWindow>>(scheduleJson)
+                    JsonSerializer.Deserialize<Dictionary<string, List<TimeWindow>>>(scheduleJson)
                     ?? throw new Exception("Invalid schedule");
 
                 Logger.Log($"Schedule OK ({schedule.Count} days)");
