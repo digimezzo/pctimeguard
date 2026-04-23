@@ -1,11 +1,12 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 class Program
 {
-    private const string TimeApiUrl =
-        "http://worldtimeapi.org/api/ip";
+    private const string TimeApiUrlTemplate =
+        "https://timeapi.io/api/Time/current/zone?timeZone={0}";
 
     private const string ScheduleUrl =
         "https://raw.githubusercontent.com/digimezzo/scheduling/main/schedule.json";
@@ -89,16 +90,7 @@ class Program
                     {
                         Logger.Log($"Attempt {attempt}: fetching internet time");
 
-                        string timeResponse = await client.GetStringAsync(TimeApiUrl);
-
-                        using var timeDoc = JsonDocument.Parse(timeResponse);
-                        string? datetimeStr =
-                            timeDoc.RootElement.GetProperty("datetime").GetString();
-
-                        if (string.IsNullOrWhiteSpace(datetimeStr))
-                            throw new Exception("Invalid time response");
-
-                        resolvedTime = DateTime.Parse(datetimeStr);
+                        resolvedTime = await FetchInternetTimeAsync(client);
                         Logger.Log($"Internet time OK: {resolvedTime:O}");
                     }
                     catch (Exception ex)
@@ -137,6 +129,69 @@ class Program
         Logger.Log(reason);
         DelayedShutdown(reason);
         throw new Exception("Unreachable");
+    }
+
+    static async Task<DateTime> FetchInternetTimeAsync(HttpClient client)
+    {
+        string timeZone = GetPreferredTimeZoneId();
+        string timeUrl = string.Format(
+            CultureInfo.InvariantCulture,
+            TimeApiUrlTemplate,
+            Uri.EscapeDataString(timeZone));
+
+        Logger.Log($"Using time API timezone '{timeZone}'");
+
+        string timeResponse = await client.GetStringAsync(timeUrl);
+        using var timeDoc = JsonDocument.Parse(timeResponse);
+
+        return ParseTimeApiDateTime(timeDoc.RootElement);
+    }
+
+    static string GetPreferredTimeZoneId()
+    {
+        string localId = TimeZoneInfo.Local.Id;
+
+        if (TimeZoneInfo.TryConvertWindowsIdToIanaId(localId, out string? ianaId) &&
+            !string.IsNullOrWhiteSpace(ianaId))
+        {
+            return ianaId;
+        }
+
+        return localId;
+    }
+
+    static DateTime ParseTimeApiDateTime(JsonElement root)
+    {
+        if (root.TryGetProperty("dateTime", out var dateTimeNode))
+        {
+            string? dateTime = dateTimeNode.GetString();
+            if (!string.IsNullOrWhiteSpace(dateTime))
+                return DateTime.Parse(dateTime, CultureInfo.InvariantCulture);
+        }
+
+        if (root.TryGetProperty("year", out var yearNode) &&
+            root.TryGetProperty("month", out var monthNode) &&
+            root.TryGetProperty("day", out var dayNode) &&
+            root.TryGetProperty("hour", out var hourNode) &&
+            root.TryGetProperty("minute", out var minuteNode) &&
+            root.TryGetProperty("seconds", out var secondNode))
+        {
+            int milliseconds = 0;
+            if (root.TryGetProperty("milliSeconds", out var millisecondNode))
+                milliseconds = millisecondNode.GetInt32();
+
+            return new DateTime(
+                yearNode.GetInt32(),
+                monthNode.GetInt32(),
+                dayNode.GetInt32(),
+                hourNode.GetInt32(),
+                minuteNode.GetInt32(),
+                secondNode.GetInt32(),
+                milliseconds,
+                DateTimeKind.Local);
+        }
+
+        throw new Exception("Invalid time response");
     }
 
     static Dictionary<string, List<TimeWindow>> ParseScheduleJson(string rawJson)
