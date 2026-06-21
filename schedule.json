@@ -5,5 +5,5 @@
   "Thursday": [{ "start": "19:00", "end": "21:45" }],
   "Friday": [{ "start": "19:00", "end": "21:45" }],
   "Saturday": [{ "start": "11:00", "end": "21:45" }],
-  "Sunday": [{ "start": "19:00", "end": "21:45" }]
+  "Sunday": [{ "start": "15:00", "end": "21:45" }]
 }
