@@ -1,197 +1,194 @@
 ﻿using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
 class Program
 {
-    private const string TimeApiUrlTemplate =
-        "https://timeapi.io/api/Time/current/zone?timeZone={0}";
+    // On non-Windows systems nothing is executed; Windows commands are only printed.
+    public static readonly bool DryRun = !OperatingSystem.IsWindows();
 
     private const string ScheduleUrl =
         "https://raw.githubusercontent.com/digimezzo/scheduling/main/schedule.json";
 
+    // Fixed on purpose: standard users can change the Windows time zone setting.
+    private const string ScheduleTimeZoneId = "Europe/Brussels";
+
+    private static readonly TimeSpan CountdownDuration = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan WarningLeadTime = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaxClockDrift = TimeSpan.FromMinutes(5);
+
+    // Difference between trusted time (server or validated clock) and the PC's UTC clock.
+    private static TimeSpan clockOffset = TimeSpan.Zero;
+
+    static DateTime TrustedUtcNow => DateTime.UtcNow + clockOffset;
+
     static async Task Main()
     {
+        try
+        {
+            SecureStorage.Initialize();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Data folder could not be secured: {ex.Message}");
+            EnforceShutdown("Data folder could not be secured");
+            return;
+        }
+
         Logger.Log("Program started");
 
         try
         {
-            using var client = new HttpClient
+            TimeZoneInfo timeZone = TimeZoneInfo.FindSystemTimeZoneById(ScheduleTimeZoneId);
+
+            (Dictionary<string, List<TimeWindow>> schedule, DateTime? serverUtc) = await GetScheduleAsync();
+
+            DateTime? nowUtc = ResolveTrustedUtc(serverUtc);
+            if (nowUtc == null)
             {
-                Timeout = TimeSpan.FromSeconds(10)
-            };
-
-            (DateTime nowUtc, Dictionary<string, List<TimeWindow>> schedule) = await GetTimeAndScheduleWithRetry(client);
-
-            TimeSpan now = nowUtc.TimeOfDay;
-            string today = nowUtc.DayOfWeek.ToString();
-
-            Logger.Log($"Time OK: {nowUtc:O} (Today={today})");
-
-            if (!schedule.TryGetValue(today, out List<TimeWindow>? windows) || windows == null || windows.Count == 0)
-            {
-                string reason = $"No schedule entry for {today}";
-                Logger.Log(reason);
-                DelayedShutdown(reason);
+                EnforceShutdown("Clock tampering detected");
                 return;
             }
 
-            bool allowed = false;
+            DateTime nowLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc.Value, timeZone);
+            TimeSpan now = nowLocal.TimeOfDay;
+            string today = nowLocal.DayOfWeek.ToString();
+
+            Logger.Log($"Time OK: {nowLocal:yyyy-MM-dd HH:mm:ss} {timeZone.Id} (Today={today})");
+
+            if (!schedule.TryGetValue(today, out List<TimeWindow>? windows) || windows == null || windows.Count == 0)
+            {
+                EnforceShutdown($"No schedule entry for {today}");
+                return;
+            }
+
+            TimeSpan? activeEnd = null;
             foreach (var window in windows)
             {
                 if (string.IsNullOrWhiteSpace(window.Start) || string.IsNullOrWhiteSpace(window.End))
                     continue;
 
-                TimeSpan start = TimeSpan.Parse(window.Start);
-                TimeSpan end = TimeSpan.Parse(window.End);
+                TimeSpan start = TimeSpan.Parse(window.Start, CultureInfo.InvariantCulture);
+                TimeSpan end = TimeSpan.Parse(window.End, CultureInfo.InvariantCulture);
 
                 Logger.Log($"Allowed window: {start} --> {end}, now={now}");
 
                 if (now >= start && now <= end)
                 {
-                    allowed = true;
+                    activeEnd = end;
                     break;
                 }
             }
 
-            if (!allowed)
+            if (activeEnd == null)
             {
-                string reason = "Outside allowed window";
-                Logger.Log(reason);
-                ShortDelayedShutdown(reason);
+                EnforceShutdown("Outside allowed window");
                 return;
             }
 
             Logger.Log("Within allowed window");
+
+            TimeSpan remaining = activeEnd.Value - now;
+            if (remaining <= WarningLeadTime)
+            {
+                DateTime endLocal = nowLocal.Date + activeEnd.Value;
+                WarnUser($"This PC will shut down at {endLocal:HH:mm}. Please save your work.");
+
+                // Stay alive until the window ends; the next 5-minute run could otherwise be too late.
+                DateTime countdownStartUtc = nowUtc.Value + remaining - CountdownDuration;
+                while (TrustedUtcNow < countdownStartUtc)
+                    Thread.Sleep(TimeSpan.FromSeconds(5));
+
+                EnforceShutdown("Allowed window ended");
+            }
         }
         catch (Exception ex)
         {
-            string reason = $"Unhandled exception: {ex}";
-            Logger.Log(reason);
-            DelayedShutdown(reason);
+            Logger.Log($"Unhandled exception: {ex}");
+            EnforceShutdown("Unexpected error");
         }
     }
 
-    static async Task<(DateTime, Dictionary<string, List<TimeWindow>>)> GetTimeAndScheduleWithRetry(HttpClient client)
+    static async Task<(Dictionary<string, List<TimeWindow>>, DateTime?)> GetScheduleAsync()
     {
-        const int maxRetries = 3;
-        const int delaySeconds = 30;
+        const int maxAttempts = 2;
 
-        DateTime? resolvedTime = null;
+        using var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
 
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                if (resolvedTime == null)
-                {
-                    try
-                    {
-                        Logger.Log($"Attempt {attempt}: fetching internet time");
+                Logger.Log($"Attempt {attempt}: fetching schedule");
 
-                        resolvedTime = await FetchInternetTimeAsync(client);
-                        Logger.Log($"Internet time OK: {resolvedTime:O}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Log($"Internet time failed: {ex.Message}");
-                        Logger.Log("Falling back to local PC time");
+                using HttpResponseMessage response = await client.GetAsync(ScheduleUrl);
+                response.EnsureSuccessStatusCode();
 
-                        resolvedTime = DateTime.Now;
-                    }
-                }
-
-                Logger.Log("Fetching schedule");
-
-                string scheduleJson =
-                    await client.GetStringAsync(ScheduleUrl);
-
+                string scheduleJson = await response.Content.ReadAsStringAsync();
                 var schedule = ParseScheduleJson(scheduleJson);
+                SecureStorage.WriteText(SecureStorage.ScheduleCacheFile, scheduleJson);
 
-                Logger.Log($"Schedule OK ({schedule.Count} days)");
+                DateTime? serverUtc = response.Headers.Date?.UtcDateTime;
+                Logger.Log($"Schedule OK ({schedule.Count} days), server time: {serverUtc:O}");
 
-                return (resolvedTime.Value, schedule);
+                return (schedule, serverUtc);
             }
             catch (Exception ex)
             {
                 Logger.Log($"Attempt {attempt} failed: {ex.Message}");
 
-                if (attempt == maxRetries)
-                    break;
-
-                Logger.Log($"Retrying in {delaySeconds} seconds");
-                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+                if (attempt < maxAttempts)
+                    await Task.Delay(TimeSpan.FromSeconds(10));
             }
         }
 
-        string reason = "Unable to fetch schedule after retries";
-        Logger.Log(reason);
-        DelayedShutdown(reason);
-        throw new Exception("Unreachable");
+        string? cachedJson = SecureStorage.ReadText(SecureStorage.ScheduleCacheFile);
+        if (cachedJson == null)
+            throw new Exception("Schedule unavailable online and no cached schedule exists");
+
+        Logger.Log("Offline: using cached schedule");
+        return (ParseScheduleJson(cachedJson), null);
     }
 
-    static async Task<DateTime> FetchInternetTimeAsync(HttpClient client)
+    static DateTime? ResolveTrustedUtc(DateTime? serverUtc)
     {
-        string timeZone = GetPreferredTimeZoneId();
-        string timeUrl = string.Format(
-            CultureInfo.InvariantCulture,
-            TimeApiUrlTemplate,
-            Uri.EscapeDataString(timeZone));
+        DateTime clockUtc = DateTime.UtcNow;
+        DateTime? lastSeenUtc = SecureStorage.ReadLastSeenUtc();
+        DateTime trustedUtc;
+        DateTime newLastSeenUtc;
 
-        Logger.Log($"Using time API timezone '{timeZone}'");
-
-        string timeResponse = await client.GetStringAsync(timeUrl);
-        using var timeDoc = JsonDocument.Parse(timeResponse);
-
-        return ParseTimeApiDateTime(timeDoc.RootElement);
-    }
-
-    static string GetPreferredTimeZoneId()
-    {
-        string localId = TimeZoneInfo.Local.Id;
-
-        if (TimeZoneInfo.TryConvertWindowsIdToIanaId(localId, out string? ianaId) &&
-            !string.IsNullOrWhiteSpace(ianaId))
+        if (serverUtc != null)
         {
-            return ianaId;
+            if ((serverUtc.Value - clockUtc).Duration() > MaxClockDrift)
+                Logger.Log($"PC clock differs from server time: clock={clockUtc:O}, server={serverUtc:O}");
+
+            trustedUtc = serverUtc.Value;
+            newLastSeenUtc = trustedUtc;
+        }
+        else
+        {
+            if (lastSeenUtc != null && clockUtc < lastSeenUtc.Value - MaxClockDrift)
+            {
+                Logger.Log($"TAMPERING: clock {clockUtc:O} is earlier than last seen time {lastSeenUtc:O}");
+                return null;
+            }
+
+            trustedUtc = clockUtc;
+            newLastSeenUtc = lastSeenUtc != null && lastSeenUtc.Value > clockUtc ? lastSeenUtc.Value : clockUtc;
         }
 
-        return localId;
-    }
+        clockOffset = trustedUtc - clockUtc;
+        SecureStorage.WriteLastSeenUtc(newLastSeenUtc);
 
-    static DateTime ParseTimeApiDateTime(JsonElement root)
-    {
-        if (root.TryGetProperty("dateTime", out var dateTimeNode))
-        {
-            string? dateTime = dateTimeNode.GetString();
-            if (!string.IsNullOrWhiteSpace(dateTime))
-                return DateTime.Parse(dateTime, CultureInfo.InvariantCulture);
-        }
-
-        if (root.TryGetProperty("year", out var yearNode) &&
-            root.TryGetProperty("month", out var monthNode) &&
-            root.TryGetProperty("day", out var dayNode) &&
-            root.TryGetProperty("hour", out var hourNode) &&
-            root.TryGetProperty("minute", out var minuteNode) &&
-            root.TryGetProperty("seconds", out var secondNode))
-        {
-            int milliseconds = 0;
-            if (root.TryGetProperty("milliSeconds", out var millisecondNode))
-                milliseconds = millisecondNode.GetInt32();
-
-            return new DateTime(
-                yearNode.GetInt32(),
-                monthNode.GetInt32(),
-                dayNode.GetInt32(),
-                hourNode.GetInt32(),
-                minuteNode.GetInt32(),
-                secondNode.GetInt32(),
-                milliseconds,
-                DateTimeKind.Local);
-        }
-
-        throw new Exception("Invalid time response");
+        return trustedUtc;
     }
 
     static Dictionary<string, List<TimeWindow>> ParseScheduleJson(string rawJson)
@@ -575,50 +572,117 @@ class Program
     }
 
 
-    // static void ForceShutdown()
-    // {
-    //     Logger.Log("FORCE SHUTDOWN triggered");
-
-    //     Process.Start(new ProcessStartInfo
-    //     {
-    //         FileName = "shutdown",
-    //         Arguments = "/s /f /t 0",
-    //         CreateNoWindow = true,
-    //         UseShellExecute = false
-    //     });
-
-    //     Environment.Exit(0);
-    // }
-
-    static void DelayedShutdown(string reason)
+    static void EnforceShutdown(string reason)
     {
-        Logger.Log("DELAYED SHUTDOWN: " + reason);
+        Logger.Log("SHUTDOWN: " + reason);
 
-        Process.Start(new ProcessStartInfo
+        // Clears any shutdown scheduled by the user, which would otherwise block ours (error 1190).
+        RunShutdown("/a");
+
+        int seconds = (int)CountdownDuration.TotalSeconds;
+        int exitCode = RunShutdown("/s", "/f", "/t", seconds.ToString(CultureInfo.InvariantCulture),
+            "/c", $"This PC will shut down in 1 minute. Save your work now. Reason: {reason}");
+        Logger.Log($"Countdown shutdown scheduled (exit code {exitCode})");
+
+        // UtcNow is unaffected by time zone changes and keeps advancing during sleep.
+        DateTime deadlineUtc = DateTime.UtcNow + CountdownDuration + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadlineUtc)
+            Thread.Sleep(TimeSpan.FromSeconds(2));
+
+        // Still running means the countdown was aborted or failed: force it.
+        while (true)
         {
-            FileName = "shutdown",
-            Arguments = $"/s /f /t 300 /c \"PC will shut down in 5 minutes. Reason: {reason}\"",
-            CreateNoWindow = true,
-            UseShellExecute = false
-        });
+            RunShutdown("/a");
+            exitCode = RunShutdown("/s", "/f", "/t", "0");
+            Logger.Log($"Immediate shutdown issued (exit code {exitCode})");
 
-        Environment.Exit(0);
+            if (DryRun)
+            {
+                Logger.Log("[DRY RUN] On Windows the immediate shutdown is repeated every 15 s until the PC is off");
+                return;
+            }
+
+            Thread.Sleep(TimeSpan.FromSeconds(15));
+        }
     }
 
-    static void ShortDelayedShutdown(string reason)
+    static int RunShutdown(params string[] arguments)
     {
-        Logger.Log("DELAYED SHUTDOWN: " + reason);
-
-        Process.Start(new ProcessStartInfo
+        if (DryRun)
         {
-            FileName = "shutdown",
-            Arguments = $"/s /f /t 30 /c \"PC will shut down in 30 seconds. Reason: {reason}\"",
-            CreateNoWindow = true,
-            UseShellExecute = false
-        });
+            string shown = string.Join(' ', arguments.Select(a => a.Contains(' ') ? $"\"{a}\"" : a));
+            Logger.Log($@"[DRY RUN] Would run: C:\Windows\System32\shutdown.exe {shown}");
+            return 0;
+        }
 
-        Environment.Exit(0);
+        try
+        {
+            var startInfo = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "shutdown.exe"))
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false
+            };
+
+            foreach (string argument in arguments)
+                startInfo.ArgumentList.Add(argument);
+
+            using Process process = Process.Start(startInfo)
+                ?? throw new Exception("Process.Start returned null");
+
+            if (!process.WaitForExit(30_000))
+                return -1;
+
+            return process.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"shutdown.exe {string.Join(' ', arguments)} failed: {ex.Message}");
+            return -1;
+        }
     }
+
+    static void WarnUser(string message)
+    {
+        if (DryRun)
+        {
+            Logger.Log($"[DRY RUN] Would show popup in the active session: {message}");
+            return;
+        }
+
+        try
+        {
+            int sessionId = WTSGetActiveConsoleSessionId();
+            if (sessionId == -1)
+                return;
+
+            const string title = "PcTimeGuard";
+            const int MB_ICONWARNING = 0x30;
+            const int MB_SETFOREGROUND = 0x10000;
+            const int MB_TOPMOST = 0x40000;
+
+            bool sent = WTSSendMessage(IntPtr.Zero, sessionId,
+                title, title.Length * sizeof(char),
+                message, message.Length * sizeof(char),
+                MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+                0, out _, false);
+
+            Logger.Log($"Warning sent to session {sessionId} (success={sent}): {message}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Warning failed: {ex.Message}");
+        }
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern int WTSGetActiveConsoleSessionId();
+
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool WTSSendMessage(
+        IntPtr hServer, int sessionId,
+        string title, int titleLength,
+        string message, int messageLength,
+        int style, int timeout, out int response, bool wait);
 }
 
 class TimeWindow
@@ -630,24 +694,100 @@ class TimeWindow
     public required string End { get; set; }
 }
 
+static class SecureStorage
+{
+    public static readonly string DataDir = Path.Combine(
+        Program.DryRun ? Path.GetTempPath() : Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "PcTimeGuard");
+
+    public static string LogFile => Path.Combine(DataDir, "Logging.log");
+    public static string ScheduleCacheFile => Path.Combine(DataDir, "schedule.cache.json");
+    private static string LastSeenFile => Path.Combine(DataDir, "lastseen.txt");
+
+    public static void Initialize()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(DataDir);
+            Logger.Log($"[DRY RUN] Using {DataDir}; on Windows it is restricted to SYSTEM and Administrators");
+            return;
+        }
+
+        InitializeWindows();
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void InitializeWindows()
+    {
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+        foreach (var sidType in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
+        {
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(sidType, null),
+                FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+        }
+
+        var directory = new DirectoryInfo(DataDir);
+        if (!directory.Exists)
+        {
+            directory.Create(security);
+            return;
+        }
+
+        // Standard users can create folders in ProgramData; one he pre-created would stay under his control.
+        var owner = directory.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        if (owner == null ||
+            !(owner.IsWellKnown(WellKnownSidType.LocalSystemSid) || owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)))
+        {
+            throw new InvalidOperationException($"{DataDir} is owned by {owner?.Value ?? "unknown"}");
+        }
+
+        directory.SetAccessControl(security);
+    }
+
+    public static string? ReadText(string path) => File.Exists(path) ? File.ReadAllText(path) : null;
+
+    public static void WriteText(string path, string content)
+    {
+        string tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, content);
+        File.Move(tempPath, path, overwrite: true);
+    }
+
+    public static DateTime? ReadLastSeenUtc()
+    {
+        string? text = ReadText(LastSeenFile);
+        if (text != null &&
+            DateTime.TryParse(text.Trim(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out DateTime value))
+        {
+            return value.ToUniversalTime();
+        }
+
+        return null;
+    }
+
+    public static void WriteLastSeenUtc(DateTime valueUtc) =>
+        WriteText(LastSeenFile, valueUtc.ToString("O", CultureInfo.InvariantCulture));
+}
+
 static class Logger
 {
-    private static readonly string LogDir = @"C:\Temp";
-    private static readonly string LogFile = Path.Combine(LogDir, "Logging.log");
-
     public static void Log(string message)
     {
         try
         {
-            if (!Directory.Exists(LogDir))
-            {
-                Directory.CreateDirectory(LogDir);
-            }
-
-            string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}";
+            string line = $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}Z  {message}{Environment.NewLine}";
 
             Console.WriteLine(line);
-            File.AppendAllText(LogFile, line);
+
+            // Only SecureStorage may create the folder, so it always gets locked-down permissions.
+            if (Directory.Exists(SecureStorage.DataDir))
+                File.AppendAllText(SecureStorage.LogFile, line);
         }
         catch
         {
